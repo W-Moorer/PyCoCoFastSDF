@@ -209,9 +209,9 @@ export SDF_TORCH3D_POINTS_CHUNK=2000000
 ## 贡献
 
 本项目由以下贡献者共同完成：
-- Wang Lijing
-- ChatGPT
-- GLM
-- Trae CN
+- **Wang Lijing** (Faculty of Computing, Harbin Institute of Technology, Heilongjiang Province, China)
+- ChatGPT (OpenAI)
+- GLM (Zhipu AI)
+- Trae CN (ByteDance Agent)
 
 欢迎提交问题报告和改进建议。

@@ -71,9 +71,7 @@ except Exception as e:
         )
     else:
         raise
-t1 = time.time()
-timings["driver_total"] = t1 - t0
-
+    
 # 3) 打印/保存耗时（饼图已自动忽略 'total'）
 for k, v in timings.items():
     print(f"{k:>20s}: {v:.3f}s")

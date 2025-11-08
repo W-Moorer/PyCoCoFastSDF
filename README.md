@@ -204,8 +204,14 @@ export SDF_TORCH3D_POINTS_CHUNK=2000000
 
 ## 许可证
 
-请参阅LICENSE文件了解项目的许可证信息。
+本项目采用MIT许可证，详情请参阅[LICENSE](LICENSE)文件。
 
 ## 贡献
+
+本项目由以下贡献者共同完成：
+- Wang Lijing
+- ChatGPT
+- GLM
+- Trae CN
 
 欢迎提交问题报告和改进建议。

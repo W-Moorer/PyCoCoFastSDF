@@ -148,38 +148,18 @@ class _Block:
     locs: Array                  # (M,3) uint8
     psi: Array                   # (M,)
     g: Array                     # (M,3)
-    # 运行时加速索引（懒构建）
-    _codes_sorted: Optional[Array] = None  # uint32
-    _ord: Optional[Array] = None           # 排序前->后的索引
+    # 小稠密指针表（懒构建）：shape=(B,B,B)，值为本块局部索引，-1 表示该处无体素
+    ptr: Optional[Array] = None  # int32
 
-    def ensure_index(self, B: int):
-        if self._codes_sorted is not None:
+    def ensure_ptr(self, B: int):
+        if self.ptr is not None:
             return
-        li = self.locs[:, 0].astype(np.uint32)
-        lj = self.locs[:, 1].astype(np.uint32)
-        lk = self.locs[:, 2].astype(np.uint32)
-        codes = li + (lj * np.uint32(B)) + (lk * np.uint32(B*B))
-        ord_ = np.argsort(codes, kind='mergesort')
-        self._codes_sorted = codes[ord_]
-        self._ord = ord_
-
-    def to_npz_dict(self) -> dict:
-        return {
-            "base": np.asarray(self.base, dtype=np.int32),
-            "locs": self.locs.astype(np.uint8, copy=False),
-            "psi": self.psi,
-            "g": self.g,
-        }
-
-    @staticmethod
-    def from_npz_dict(d: dict) -> "_Block":
-        b = tuple(int(x) for x in np.asarray(d["base"]).tolist())
-        return _Block(
-            base=b,
-            locs=np.asarray(d["locs"], dtype=np.uint8),
-            psi=np.asarray(d["psi"]),
-            g=np.asarray(d["g"]),
-        )
+        ptr = np.full((B, B, B), -1, dtype=np.int32)
+        li = self.locs[:, 0].astype(np.intp)
+        lj = self.locs[:, 1].astype(np.intp)
+        lk = self.locs[:, 2].astype(np.intp)
+        ptr[li, lj, lk] = np.arange(self.locs.shape[0], dtype=np.int32)
+        self.ptr = ptr
 
 
 class HashedGradientSDF:
@@ -197,6 +177,14 @@ class HashedGradientSDF:
         self._g_all: Optional[np.ndarray] = None       # 与 codes_all 对齐 (N,3)
         # 全局 O(1) 反向映射：linear_index -> packed index（-1 表示缺失），懒构建
         self._index_map: Optional[np.ndarray] = None   # int32, 长度 nx*ny*nz，-1 表示 miss
+        # 查询后端：'index_map'（默认，最快，O(1) 全向量化）或 'block_ptr'（B×B×B 指针表）
+        self.query_backend: str = 'index_map'
+        # ---- Block Atlas （跨块全向量化 O(1) 指针表） ----
+        self._atlas_stride: int = self.block_size ** 3
+        self._atlas_ptr_flat: Optional[np.ndarray] = None   # int32, shape=(num_blocks*B^3,)
+        self._block_row_map: Optional[np.ndarray] = None    # int32, length = nbx*nby*nz, -1=absent
+        self._packed_psi: Optional[np.ndarray] = None       # packed over all blocks
+        self._packed_g: Optional[np.ndarray] = None
     @staticmethod
     def build_from_dense(vol: GradientSDFVolume, tau: float = 10.0, block_size: int = 8, dtype: str = "float32") -> "HashedGradientSDF":
         """从稠密体素提取窄带 |ψ|<=tau 的稀疏哈希并构建对象。
@@ -218,8 +206,8 @@ class HashedGradientSDF:
             if key not in buckets:
                 buckets[key] = []
             psi = float(sdf[i, j, k])
-            g = grad[i, j, k]
-            buckets[key].append(((int(i), int(j), int(k)), psi, g))
+            gvec = grad[i, j, k]
+            buckets[key].append(((int(i), int(j), int(k)), psi, gvec))
         blk_objs: Dict[Tuple[int, int, int], _Block] = {}
         for key, triplets in buckets.items():
             base = (key[0]*B, key[1]*B, key[2]*B)
@@ -236,6 +224,21 @@ class HashedGradientSDF:
 
     def attach_dense_fallback(self, vol: GradientSDFVolume):
         self._dense = vol
+
+    def set_query_backend(self, mode: str = 'index_map'):
+        if mode not in ('index_map', 'block_ptr', 'block_atlas'):
+            raise ValueError("mode must be 'index_map', 'block_ptr', or 'block_atlas'")
+        self.query_backend = mode
+
+    def warmup(self, *, index_map: bool = True, ptr_table: bool = False, atlas: bool = False):
+        if index_map:
+            self._ensure_index_map()
+        if ptr_table:
+            B = self.block_size
+            for blk in self.blocks.values():
+                blk.ensure_ptr(B)
+        if atlas:
+            self._ensure_block_atlas()
 
     # ---- 懒构建全局索引：把所有块拼成一个按绝对线性编码排序的大表 ----
     def _ensure_global_index(self):
@@ -279,6 +282,46 @@ class HashedGradientSDF:
             index_map[self._codes_all] = np.arange(self._codes_all.size, dtype=np.int32)
         self._index_map = index_map
 
+    # ---- 懒构建 Block Atlas：跨块全向量化 O(1) 查询 ----
+    def _ensure_block_atlas(self):
+        if self._atlas_ptr_flat is not None:
+            return
+        B = self.block_size
+        nx, ny, nz = self.spec.shape
+        nbx, nby = self._nbx, self._nby
+        # 为每个实际存在的块分配一行（长度 B^3），存 packed 全局索引；其余置 -1
+        num_blocks = len(self.blocks)
+        stride = B * B * B
+        atlas_ptr = np.full((num_blocks, stride), -1, dtype=np.int32)
+        # block_lin -> row 的映射表（稀疏小数组）
+        block_row_map = np.full((nbx * nby * ((nz + B - 1)//B),), -1, dtype=np.int32)
+
+        # 先为每个块确定一个 row，并计算该块在 packed 数组里的偏移
+        # 我们把所有块的 (psi, g) 也拼接成 packed_psi/g，便于 O(1) 直接寻址
+        packed_psi = []
+        packed_g = []
+        row = 0
+        for (kx, ky, kz), blk in self.blocks.items():
+            block_row_map[kx + nbx * (ky + nby * kz)] = row
+            # 该块的局部 -> 全局 packed 偏移
+            base_off = sum(arr.shape[0] for arr in packed_psi)
+            # 确保局部索引存在
+            li = blk.locs[:, 0].astype(np.intp)
+            lj = blk.locs[:, 1].astype(np.intp)
+            lk = blk.locs[:, 2].astype(np.intp)
+            local_code = (li + B * (lj + B * lk)).astype(np.intp)
+            # 把该块的本地索引映射到 atlas 行
+            atlas_ptr[row, local_code] = base_off + np.arange(blk.locs.shape[0], dtype=np.int32)
+            # 追加 payload
+            packed_psi.append(blk.psi)
+            packed_g.append(blk.g)
+            row += 1
+        self._atlas_ptr_flat = atlas_ptr.ravel()
+        self._atlas_stride = stride
+        self._block_row_map = block_row_map
+        self._packed_psi = np.concatenate(packed_psi) if len(packed_psi) else np.empty((0,), dtype=np.float64)
+        self._packed_g = np.concatenate(packed_g, axis=0) if len(packed_g) else np.empty((0,3), dtype=np.float64)
+
     # -------------------- 批量向量化哈希查询（修复越界） --------------------
     def taylor_query_batch(self, P: Array, allow_fallback: bool = False) -> Tuple[Array, Array, Array, Array, Array]:
         P = np.asarray(P, dtype=np.float64)
@@ -290,6 +333,276 @@ class HashedGradientSDF:
         hit = np.zeros((len(P),), dtype=bool)
         if not np.any(inb):
             return d, g, vj, ijk, hit
+
+        if self.query_backend == 'index_map':
+            # ---- 全向量化 O(1) 路径：index_map ----
+            self._ensure_index_map()
+            index_map = self._index_map  # type: ignore
+            psi_all = self._psi_all      # type: ignore
+            g_all = self._g_all          # type: ignore
+            nx, ny, nz = self.spec.shape
+
+            I = ijk[inb, 0].astype(np.int64)
+            J = ijk[inb, 1].astype(np.int64)
+            K = ijk[inb, 2].astype(np.int64)
+            code_q = I + nx * (J + ny * K)
+            idx = index_map[code_q]
+            ok = idx >= 0
+            if np.any(ok):
+                out_idx = np.where(inb)[0][ok]
+                idx2 = idx[ok].astype(np.int64)
+                psi = psi_all[idx2].astype(np.float64)
+                gg = g_all[idx2].astype(np.float64)
+                diff = P[out_idx] - vj[out_idx]
+                d[out_idx] = psi + np.einsum('ij,ij->i', diff, gg)
+                g[out_idx] = gg
+                hit[out_idx] = True
+
+        elif self.query_backend == 'block_atlas':
+            # ---- 跨块全向量化 O(1) 路径：Block Atlas ----
+            self._ensure_block_atlas()
+            nx, ny, nz = self.spec.shape
+            B = self.block_size
+            nbx, nby = self._nbx, self._nby
+            stride = self._atlas_stride
+            atlas = self._atlas_ptr_flat      # type: ignore
+            row_map = self._block_row_map     # type: ignore
+            psi_all = self._packed_psi        # type: ignore
+            g_all = self._packed_g            # type: ignore
+
+            I = ijk[inb, 0].astype(np.int64)
+            J = ijk[inb, 1].astype(np.int64)
+            K = ijk[inb, 2].astype(np.int64)
+            kx = I // B
+            ky = J // B
+            kz = K // B
+            row = row_map[kx + nbx * (ky + nby * kz)]
+            ok_row = row >= 0
+            if np.any(ok_row):
+                idx_pts = np.where(inb)[0][ok_row]
+                row = row[ok_row].astype(np.int64)
+                li = (I[ok_row] - (kx[ok_row] * B)).astype(np.int64)
+                lj = (J[ok_row] - (ky[ok_row] * B)).astype(np.int64)
+                lk = (K[ok_row] - (kz[ok_row] * B)).astype(np.int64)
+                # 局部索引合法性（极少数边界问题）
+                ok_loc = (li >= 0) & (li < B) & (lj >= 0) & (lj < B) & (lk >= 0) & (lk < B)
+                if np.any(ok_loc):
+                    idx_pts2 = idx_pts[ok_loc]
+                    row2 = row[ok_loc]
+                    li = li[ok_loc]
+                    lj = lj[ok_loc]
+                    lk = lk[ok_loc]
+                    local_code = li + B * (lj + B * lk)
+                    atlas_idx = row2 * stride + local_code
+                    ptr = atlas[atlas_idx]
+                    ok_ptr = ptr >= 0
+                    if np.any(ok_ptr):
+                        idx_fin = idx_pts2[ok_ptr]
+                        ptr2 = ptr[ok_ptr].astype(np.int64)
+                        psi = psi_all[ptr2].astype(np.float64)
+                        gg = g_all[ptr2].astype(np.float64)
+                        diff = P[idx_fin] - vj[idx_fin]
+                        d[idx_fin] = psi + np.einsum('ij,ij->i', diff, gg)
+                        g[idx_fin] = gg
+                        hit[idx_fin] = True
+
+        else:  # 'block_ptr'（按块循环）
+            I = ijk[inb, 0].astype(np.int64)
+            J = ijk[inb, 1].astype(np.int64)
+            K = ijk[inb, 2].astype(np.int64)
+            B = self.block_size
+            out_idx = np.where(inb)[0]
+            kx = I // B
+            ky = J // B
+            kz = K // B
+            key_lin = (kx + self._nbx * (ky + self._nby * kz)).astype(np.int64)
+            uniq, inv = np.unique(key_lin, return_inverse=True)
+
+            for u, code in enumerate(uniq):
+                kz_u = code // (self._nbx * self._nby)
+                rem = code - kz_u * (self._nbx * self._nby)
+                ky_u = rem // self._nbx
+                kx_u = rem - ky_u * self._nbx
+                key = (int(kx_u), int(ky_u), int(kz_u))
+                blk = self.blocks.get(key)
+                if blk is None:
+                    continue
+                blk.ensure_ptr(B)
+                sel = (inv == u)
+                idx_pts = out_idx[sel]
+                li = I[sel] - blk.base[0]
+                lj = J[sel] - blk.base[1]
+                lk = K[sel] - blk.base[2]
+                ok = (li >= 0) & (li < B) & (lj >= 0) & (lj < B) & (lk >= 0) & (lk < B)
+                if not np.any(ok):
+                    continue
+                li = li[ok].astype(np.intp)
+                lj = lj[ok].astype(np.intp)
+                lk = lk[ok].astype(np.intp)
+                idx_ok = idx_pts[ok]
+                ptr = blk.ptr  # type: ignore
+                local_idx = ptr[li, lj, lk]
+                ok2 = local_idx >= 0
+                if not np.any(ok2):
+                    continue
+                local_idx = local_idx[ok2].astype(np.int64)
+                idx_fin = idx_ok[ok2]
+                psi = blk.psi[local_idx].astype(np.float64)
+                gg = blk.g[local_idx].astype(np.float64)
+                diff = P[idx_fin] - vj[idx_fin]
+                d[idx_fin] = psi + np.einsum('ij,ij->i', diff, gg)
+                g[idx_fin] = gg
+                hit[idx_fin] = True
+
+        if allow_fallback and (self._dense is not None):
+            miss = inb & (~hit)
+            if np.any(miss):
+                d2, g2, _, _, _ = self._dense.taylor_query_batch(P[miss])
+                d[miss] = d2
+                g[miss] = g2
+                hit[miss] = np.isfinite(d2)
+        return d, g, vj, ijk, hit
+
+        if self.query_backend == 'index_map':
+            # ---- 全向量化 O(1) 路径：index_map ----
+            self._ensure_index_map()
+            index_map = self._index_map  # type: ignore
+            psi_all = self._psi_all      # type: ignore
+            g_all = self._g_all          # type: ignore
+            nx, ny, nz = self.spec.shape
+
+            I = ijk[inb, 0].astype(np.int64)
+            J = ijk[inb, 1].astype(np.int64)
+            K = ijk[inb, 2].astype(np.int64)
+            code_q = I + nx * (J + ny * K)
+            idx = index_map[code_q]
+            ok = idx >= 0
+            if np.any(ok):
+                out_idx = np.where(inb)[0][ok]
+                idx2 = idx[ok].astype(np.int64)
+                psi = psi_all[idx2].astype(np.float64)
+                gg = g_all[idx2].astype(np.float64)
+                diff = P[out_idx] - vj[out_idx]
+                d[out_idx] = psi + np.einsum('ij,ij->i', diff, gg)
+                g[out_idx] = gg
+                hit[out_idx] = True
+        else:
+            # ---- 块内小稠密指针表路径：按块 O(1) 直接寻址 ----
+            I = ijk[inb, 0].astype(np.int64)
+            J = ijk[inb, 1].astype(np.int64)
+            K = ijk[inb, 2].astype(np.int64)
+            B = self.block_size
+            out_idx = np.where(inb)[0]
+            kx = I // B
+            ky = J // B
+            kz = K // B
+            key_lin = (kx + self._nbx * (ky + self._nby * kz)).astype(np.int64)
+            uniq, inv = np.unique(key_lin, return_inverse=True)
+
+            for u, code in enumerate(uniq):
+                kz_u = code // (self._nbx * self._nby)
+                rem = code - kz_u * (self._nbx * self._nby)
+                ky_u = rem // self._nbx
+                kx_u = rem - ky_u * self._nbx
+                key = (int(kx_u), int(ky_u), int(kz_u))
+                blk = self.blocks.get(key)
+                if blk is None:
+                    continue
+                blk.ensure_ptr(B)
+                sel = (inv == u)
+                idx_pts = out_idx[sel]
+                li = I[sel] - blk.base[0]
+                lj = J[sel] - blk.base[1]
+                lk = K[sel] - blk.base[2]
+                ok = (li >= 0) & (li < B) & (lj >= 0) & (lj < B) & (lk >= 0) & (lk < B)
+                if not np.any(ok):
+                    continue
+                li = li[ok].astype(np.intp)
+                lj = lj[ok].astype(np.intp)
+                lk = lk[ok].astype(np.intp)
+                idx_ok = idx_pts[ok]
+                ptr = blk.ptr  # type: ignore
+                local_idx = ptr[li, lj, lk]
+                ok2 = local_idx >= 0
+                if not np.any(ok2):
+                    continue
+                local_idx = local_idx[ok2].astype(np.int64)
+                idx_fin = idx_ok[ok2]
+                psi = blk.psi[local_idx].astype(np.float64)
+                gg = blk.g[local_idx].astype(np.float64)
+                diff = P[idx_fin] - vj[idx_fin]
+                d[idx_fin] = psi + np.einsum('ij,ij->i', diff, gg)
+                g[idx_fin] = gg
+                hit[idx_fin] = True
+
+        if allow_fallback and (self._dense is not None):
+            miss = inb & (~hit)
+            if np.any(miss):
+                d2, g2, _, _, _ = self._dense.taylor_query_batch(P[miss])
+                d[miss] = d2
+                g[miss] = g2
+                hit[miss] = np.isfinite(d2)
+        return d, g, vj, ijk, hit
+
+        I = ijk[inb, 0].astype(np.int64)
+        J = ijk[inb, 1].astype(np.int64)
+        K = ijk[inb, 2].astype(np.int64)
+        B = self.block_size
+        out_idx = np.where(inb)[0]
+
+        # 分块：唯一编码 + 反算 block key
+        kx = I // B
+        ky = J // B
+        kz = K // B
+        key_lin = (kx + self._nbx * (ky + self._nby * kz)).astype(np.int64)
+        uniq, inv = np.unique(key_lin, return_inverse=True)
+
+        for u, code in enumerate(uniq):
+            kz_u = code // (self._nbx * self._nby)
+            rem = code - kz_u * (self._nbx * self._nby)
+            ky_u = rem // self._nbx
+            kx_u = rem - ky_u * self._nbx
+            key = (int(kx_u), int(ky_u), int(kz_u))
+            blk = self.blocks.get(key)
+            if blk is None:
+                continue
+            blk.ensure_ptr(B)
+            sel = (inv == u)
+            idx_pts = out_idx[sel]
+            li = I[sel] - blk.base[0]
+            lj = J[sel] - blk.base[1]
+            lk = K[sel] - blk.base[2]
+            ok = (li >= 0) & (li < B) & (lj >= 0) & (lj < B) & (lk >= 0) & (lk < B)
+            if not np.any(ok):
+                continue
+            li = li[ok].astype(np.intp)
+            lj = lj[ok].astype(np.intp)
+            lk = lk[ok].astype(np.intp)
+            idx_ok = idx_pts[ok]
+            # O(1) 直接寻址：从 ptr 取块内局部索引
+            ptr = blk.ptr  # type: ignore
+            local_idx = ptr[li, lj, lk]
+            ok2 = local_idx >= 0
+            if not np.any(ok2):
+                continue
+            local_idx = local_idx[ok2].astype(np.int64)
+            idx_fin = idx_ok[ok2]
+
+            psi = blk.psi[local_idx].astype(np.float64)
+            gg = blk.g[local_idx].astype(np.float64)
+            diff = P[idx_fin] - vj[idx_fin]
+            d[idx_fin] = psi + np.einsum('ij,ij->i', diff, gg)
+            g[idx_fin] = gg
+            hit[idx_fin] = True
+
+        if allow_fallback and (self._dense is not None):
+            miss = inb & (~hit)
+            if np.any(miss):
+                d2, g2, _, _, _ = self._dense.taylor_query_batch(P[miss])
+                d[miss] = d2
+                g[miss] = g2
+                hit[miss] = np.isfinite(d2)
+        return d, g, vj, ijk, hit
 
         self._ensure_index_map()
         codes_all = self._codes_all  # type: ignore

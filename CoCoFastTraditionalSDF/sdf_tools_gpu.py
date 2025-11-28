@@ -17,7 +17,7 @@ sdf_tools_gpu.py — 高效而鲁棒的 SDF 计算工具（默认：FWN/SD + AAB
 """
 from __future__ import annotations
 
-import os, json, math, argparse, time, hashlib
+import os, json, math, argparse, time, hashlib, struct
 from typing import Optional, Tuple, Dict, List
 
 import numpy as np
@@ -644,6 +644,7 @@ def save_sdf_and_meta(sdf_grid: np.ndarray,
                       timings: Dict[str, float],
                       out_prefix: str) -> Tuple[str, str, str, str]:
     npy_path = f"{out_prefix}_sdf.npy"
+    bin_path = f"{out_prefix}_sdf.sdf"
     meta_path = f"{out_prefix}_meta.json"
     png_path = f"{out_prefix}_isosurface.png"
     pie_path = f"{out_prefix}_timings_pie.png"
@@ -651,13 +652,37 @@ def save_sdf_and_meta(sdf_grid: np.ndarray,
     _ensure_dir_for(npy_path)
     np.save(npy_path, sdf_grid)
 
+    _ensure_dir_for(bin_path)
+    nx, ny, nz = map(int, sdf_grid.shape)
+    bmin, bmax = bounds
+    dtype_code = 8
+    order_code = 0
+    with open(bin_path, 'wb') as bf:
+        hdr = struct.pack(
+            '<4sIII6f3ffBB',
+            b'SDFB', nx, ny, nz,
+            float(bmin[0]), float(bmin[1]), float(bmin[2]),
+            float(bmax[0]), float(bmax[1]), float(bmax[2]),
+            float(voxel_step[0]), float(voxel_step[1]), float(voxel_step[2]),
+            float(padding),
+            dtype_code, order_code
+        )
+        bf.write(hdr)
+        bf.write(np.asarray(sdf_grid, dtype=np.float64).ravel(order='C').tobytes(order='C'))
+
     meta = dict(
         obj=os.path.abspath(obj_path),
         bounds_min=list(map(float, bounds[0])),
         bounds_max=list(map(float, bounds[1])),
         voxel_step=list(map(float, voxel_step)),
         padding=float(padding),
-        timings={k: float(v) for k, v in timings.items()}
+        timings={k: float(v) for k, v in timings.items()},
+        binary=dict(
+            path=os.path.abspath(bin_path),
+            dtype='float64',
+            order='C',
+            shape=[nx, ny, nz]
+        )
     )
     with open(meta_path, 'w', encoding='utf-8') as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)

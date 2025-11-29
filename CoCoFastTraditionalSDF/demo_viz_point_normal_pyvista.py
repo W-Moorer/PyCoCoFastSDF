@@ -13,11 +13,13 @@ demo_viz_point_normal_pyvista_signfix.py
 """
 
 # ========== 在这里设置你的文件路径与测试点 ==========
-SDF_NPY_FILE = "./traditional_outputs/gear_sdf.npy"
-META_JSON_FILE = "./traditional_outputs/gear_meta.json"
+SDF_NPY_FILE = "./traditional_outputs/cube_sdf.npy"
+META_JSON_FILE = "./traditional_outputs/cube_meta.json"
 SDF_BIN_FILE = None
 SCREENSHOT = None
-point_position = (22.6024, 0.347387, -1.64363)
+point_position = (0.0025825837736966300, -0.099401121016928301, -0.0052144821680076749)
+POSE_T = (-0.3, -0.3, -0.2)
+POSE_Q_WXYZ = (1.0, 0.0, 0.0, 0.0)
 # ===========================================
 
 import json, numpy as np
@@ -101,6 +103,26 @@ def trilinear_value_and_grad(sdf, bmin, step, x_world):
     n_raw = grad / (np.linalg.norm(grad) + 1e-12)
     return float(ds), n_raw, grad
 
+def _quat_to_R(qwxyz):
+    q = np.asarray(qwxyz, dtype=float)
+    w, x, y, z = q.tolist()
+    n = float(np.sqrt(w*w + x*x + y*y + z*z))
+    if n <= 1e-12:
+        return np.eye(3, dtype=float)
+    w /= n; x /= n; y /= n; z /= n
+    return np.array([
+        [1-2*(y*y+z*z), 2*(x*y - z*w), 2*(x*z + y*w)],
+        [2*(x*y + z*w), 1-2*(x*x+z*z), 2*(y*z - x*w)],
+        [2*(x*z - y*w), 2*(y*z + x*w), 1-2*(x*x+y*y)]
+    ], dtype=float)
+
+def trilinear_value_and_grad_pose(sdf, bmin, step, x_world, R, t):
+    x_local = np.dot(R.T, (np.asarray(x_world, dtype=float) - np.asarray(t, dtype=float)))
+    ds, n_raw_local, grad_local = trilinear_value_and_grad(sdf, bmin, step, x_local)
+    g_world = np.dot(R, grad_local)
+    n_world = g_world / (np.linalg.norm(g_world) + 1e-12)
+    return ds, n_world, g_world
+
 def project_to_surface(sdf, bmin, step, x0, iters=5):
     x = np.asarray(x0, dtype=float)
     ds, n_raw, grad = trilinear_value_and_grad(sdf, bmin, step, x)
@@ -135,6 +157,51 @@ def project_to_surface(sdf, bmin, step, x0, iters=5):
             for __ in range(10):
                 xt = x - alpha * ds * g / gn2
                 dst, _, gradt = trilinear_value_and_grad(sdf, bmin, step, xt)
+                if abs(dst) < abs(ds):
+                    x = xt; ds = dst; grad = gradt
+                    improved = True
+                    break
+                alpha *= 0.5
+            if not improved:
+                break
+        if abs(ds) <= 1e-8:
+            break
+    return x
+
+def project_to_surface_pose(sdf, bmin, step, x0, R, t, iters=5):
+    x = np.asarray(x0, dtype=float)
+    ds, n_raw, grad = trilinear_value_and_grad_pose(sdf, bmin, step, x, R, t)
+    for _ in range(max(1, iters)):
+        g = grad
+        gn2 = float(np.dot(g, g))
+        if gn2 <= 1e-20:
+            break
+        x1 = x - ds * g / gn2
+        ds1, n_raw1, grad1 = trilinear_value_and_grad_pose(sdf, bmin, step, x1, R, t)
+        if ds * ds1 <= 0.0:
+            a = x; va = ds; b = x1; vb = ds1
+            for __ in range(24):
+                m = (a + b) * 0.5
+                vm, _, _ = trilinear_value_and_grad_pose(sdf, bmin, step, m, R, t)
+                if abs(vm) <= 1e-8:
+                    x = m; ds = vm; grad = grad1
+                    break
+                if va * vm <= 0.0:
+                    b = m; vb = vm
+                else:
+                    a = m; va = vm
+            else:
+                x = (a + b) * 0.5
+                ds, grad = trilinear_value_and_grad_pose(sdf, bmin, step, x, R, t)[0:3:2]
+            break
+        elif abs(ds1) < abs(ds):
+            x = x1; ds = ds1; grad = grad1
+        else:
+            alpha = 0.5
+            improved = False
+            for __ in range(10):
+                xt = x - alpha * ds * g / gn2
+                dst, _, gradt = trilinear_value_and_grad_pose(sdf, bmin, step, xt, R, t)
                 if abs(dst) < abs(ds):
                     x = xt; ds = dst; grad = gradt
                     improved = True
@@ -186,7 +253,48 @@ def _refine_tip_along_normal(sdf, bmin, step, x, n_out, ds, grad,
             if abs(ft) <= tol:
                 break
         ft_final, _n_final, _g_final = trilinear_value_and_grad(sdf, bmin, step, x + dirv * t)
-        return t, x + dirv * t, ft_final
+    return t, x + dirv * t, ft_final
+
+def _refine_tip_along_normal_pose(sdf, bmin, step, x, n_out, ds, grad, R, t,
+                                  tol=1e-9, max_iter=32):
+    import numpy as _np
+    dirv = _np.asarray(n_out, dtype=float)
+    f0 = float(ds)
+    gnorm = float(_np.linalg.norm(grad))
+    t1 = float(abs(ds)) / max(gnorm, 1e-12)
+    f1, _n1, g1 = trilinear_value_and_grad_pose(sdf, bmin, step, x + dirv * t1, R, t)
+    if f0 * f1 <= 0.0:
+        a, fa = 0.0, f0
+        b, fb = t1, f1
+        m = 0.5 * (a + b)
+        for _ in range(max_iter):
+            m = 0.5 * (a + b)
+            fm, _nm, _gm = trilinear_value_and_grad_pose(sdf, bmin, step, x + dirv * m, R, t)
+            if abs(fm) <= tol or abs(b - a) <= tol:
+                return m, x + dirv * m, fm
+            if fa * fm <= 0.0:
+                b, fb = m, fm
+            else:
+                a, fa = m, fm
+        return m, x + dirv * m, fm
+    else:
+        tt = t1
+        for _ in range(max_iter):
+            ft, _nt, gt = trilinear_value_and_grad_pose(sdf, bmin, step, x + dirv * tt, R, t)
+            dd = float(_np.dot(gt, dirv))
+            if abs(dd) <= 1e-14:
+                break
+            t_next = tt - ft / dd
+            if t_next < 0.0:
+                t_next = 0.5 * tt
+            if abs(t_next - tt) <= tol:
+                tt = t_next
+                break
+            tt = t_next
+            if abs(ft) <= tol:
+                break
+        ft_final, _n_final, _g_final = trilinear_value_and_grad_pose(sdf, bmin, step, x + dirv * tt, R, t)
+        return tt, x + dirv * tt, ft_final
 
 # ---- PyVista 可视化 ----
 def make_grid_from_sdf(sdf, bmin, step):
@@ -207,6 +315,9 @@ def visualize(sdf, bmin, bmax, step, ds, n_out, x, x_proj, inside, outside_posit
     import pyvista as pv, numpy as _np
     grid = make_grid_from_sdf(sdf, bmin, step)
     surf = grid.contour([0.0], scalars="values")
+    R = _quat_to_R(POSE_Q_WXYZ)
+    t = _np.asarray(POSE_T, dtype=float)
+    surf.points = surf.points.dot(R.T) + t
     plotter = pv.Plotter(window_size=[1100, 850])
     plotter.add_mesh(surf, opacity=0.7, smooth_shading=True)
 
@@ -218,15 +329,15 @@ def visualize(sdf, bmin, bmax, step, ds, n_out, x, x_proj, inside, outside_posit
     plotter.add_mesh(pv.Sphere(radius=0.8*lunit, center=x), color=color_in, name="query_point")
     plotter.add_mesh(pv.Sphere(radius=0.1*lunit, center=x_proj), color="cyan", name="proj_on_iso")
     plotter.add_mesh(pv.Line(x, x_proj), line_width=3, color="white", name="line_to_iso")
-    _ds0, _n0, _g0 = trilinear_value_and_grad(sdf, bmin, step, x)
-    t_star, x_tip, tip_val = _refine_tip_along_normal(sdf, bmin, step, x, n_out, ds, _g0)
+    _ds0, _n0, _g0 = trilinear_value_and_grad_pose(sdf, bmin, step, x, R, t)
+    t_star, x_tip, tip_val = _refine_tip_along_normal_pose(sdf, bmin, step, x, n_out, ds, _g0, R, t)
     depth = float(t_star) if inside else 0.0
     dir_vec = x_tip - x
     dir_len = float(_np.linalg.norm(dir_vec))
     dir_hat = dir_vec / (dir_len + 1e-12)
     plotter.add_mesh(pv.Arrow(start=x, direction=dir_hat, scale=max(dir_len, 1e-9)), color="yellow", name="normal_out")
     plotter.add_mesh(pv.Sphere(radius=0.4*lunit, center=x_tip), color="white", name="arrow_tip")
-    ds_tip, n_raw_tip, _g_tip = trilinear_value_and_grad(sdf, bmin, step, x_tip)
+    ds_tip, n_raw_tip, _g_tip = trilinear_value_and_grad_pose(sdf, bmin, step, x_tip, R, t)
     n_out_tip = (n_raw_tip if outside_positive else -n_raw_tip)
     plotter.add_mesh(pv.Arrow(start=x_tip, direction=n_out_tip, scale=3.0*lunit), color="orange", name="normal_at_tip")
 
@@ -253,13 +364,15 @@ def main():
     print(f"[Sign detection] outside_positive={outside_positive} (neg_ratio={neg_ratio:.3f})")
 
     xq = point_position if point_position is not None else tuple(((bmin + bmax) * 0.5).tolist())
-    ds, n_raw, grad = trilinear_value_and_grad(sdf, bmin, step, xq)
+    R = _quat_to_R(POSE_Q_WXYZ)
+    t = np.asarray(POSE_T, dtype=float)
+    ds, n_raw, grad = trilinear_value_and_grad_pose(sdf, bmin, step, xq, R, t)
 
     # 外法向：根据约定选择方向
     n_out = (n_raw if outside_positive else -n_raw)
 
     inside = (ds < 0.0) if outside_positive else (ds > 0.0)
-    t_star, x_tip, tip_val = _refine_tip_along_normal(sdf, bmin, step, np.array(xq, dtype=float), n_out, ds, grad)
+    t_star, x_tip, tip_val = _refine_tip_along_normal_pose(sdf, bmin, step, np.array(xq, dtype=float), n_out, ds, grad, R, t)
     depth = float(t_star) if inside else 0.0
 
     print(f"[Point] {xq}")
@@ -268,12 +381,12 @@ def main():
     print(f"[n_raw] {n_raw}")
     print(f"[n_out] {n_out}  | inside={inside}")
 
-    ds_tip, n_raw_tip, _gtip = trilinear_value_and_grad(sdf, bmin, step, x_tip)
+    ds_tip, n_raw_tip, _gtip = trilinear_value_and_grad_pose(sdf, bmin, step, x_tip, R, t)
     n_out_tip = (n_raw_tip if outside_positive else -n_raw_tip)
     print(f"[Tip] SDF(tip) = {tip_val:.3e}  |  penetration = {depth:.6g}")
     print(f"[n_out_tip] {n_out_tip}")
 
-    x_proj = project_to_surface(sdf, bmin, step, xq, iters=5)
+    x_proj = project_to_surface_pose(sdf, bmin, step, xq, R, t, iters=5)
 
     try:
         visualize(sdf, bmin, bmax, step, ds, n_out, xq, x_proj, inside, outside_positive, grad_norm=float(np.linalg.norm(grad)), screenshot=SCREENSHOT)

@@ -36,7 +36,7 @@ def pick_backend() -> str:
 # 获取当前脚本所在目录的父目录（项目根目录）
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(script_dir)
-obj_path = os.path.join(project_root, "obj_library", "gear.obj")
+obj_path = os.path.join(project_root, "obj_library", "RecurdynSlaveGearTri.obj")
 
 # 从obj文件路径中提取文件名（不含扩展名）作为输出前缀
 obj_filename = os.path.splitext(os.path.basename(obj_path))[0]

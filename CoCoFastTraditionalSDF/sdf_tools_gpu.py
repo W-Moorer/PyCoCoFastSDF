@@ -173,6 +173,7 @@ def _voxel_grid_axes(bmin: np.ndarray, bmax: np.ndarray, voxel_size: float) -> T
         zs = np.append(zs, zs[-1] + voxel_size)
         
     return xs, ys, zs
+
 def _grid_points(xs: np.ndarray, ys: np.ndarray, zs: np.ndarray) -> np.ndarray:
     X, Y, Z = np.meshgrid(xs, ys, zs, indexing='ij')
     pts = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1).astype(np.float64)

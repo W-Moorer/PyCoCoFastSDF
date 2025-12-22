@@ -148,15 +148,31 @@ def _compute_bounds(vertices: np.ndarray, padding: float) -> Tuple[np.ndarray, n
     return (vmin - pad).astype(np.float64), (vmax + pad).astype(np.float64)
 
 def _voxel_grid_axes(bmin: np.ndarray, bmax: np.ndarray, voxel_size: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    size = (bmax - bmin)
-    nx = max(2, int(math.ceil(size[0] / voxel_size)))
-    ny = max(2, int(math.ceil(size[1] / voxel_size)))
-    nz = max(2, int(math.ceil(size[2] / voxel_size)))
-    xs = np.linspace(bmin[0], bmax[0], nx, dtype=np.float64)
-    ys = np.linspace(bmin[1], bmax[1], ny, dtype=np.float64)
-    zs = np.linspace(bmin[2], bmax[2], nz, dtype=np.float64)
-    return xs, ys, zs
+    # 修正 1: 使用 Cell-Centered 逻辑，起点偏移半个 voxel_size
+    # 修正 2: 使用 np.arange 保证步长严格一致，避免 linspace 的拉伸误差
+    
+    # 重新计算基于步长的终点，确保覆盖原始 bmax
+    # 这里我们生成从 bmin + half_step 开始的序列
+    half_step = voxel_size * 0.5
+    
+    # X 轴
+    xs = np.arange(bmin[0] + half_step, bmax[0], voxel_size, dtype=np.float64)
+    # 确保最后一个点如果不小心超出了 bmax (由于浮点误差) 或没覆盖到，进行微调（可选，视具体需求）
+    # 通常 arange 足够，但为了仅仅覆盖包围盒，我们可以动态扩展 max
+    if xs[-1] + half_step < bmax[0]:
+        xs = np.append(xs, xs[-1] + voxel_size)
 
+    # Y 轴
+    ys = np.arange(bmin[1] + half_step, bmax[1], voxel_size, dtype=np.float64)
+    if ys[-1] + half_step < bmax[1]:
+        ys = np.append(ys, ys[-1] + voxel_size)
+
+    # Z 轴
+    zs = np.arange(bmin[2] + half_step, bmax[2], voxel_size, dtype=np.float64)
+    if zs[-1] + half_step < bmax[2]:
+        zs = np.append(zs, zs[-1] + voxel_size)
+        
+    return xs, ys, zs
 def _grid_points(xs: np.ndarray, ys: np.ndarray, zs: np.ndarray) -> np.ndarray:
     X, Y, Z = np.meshgrid(xs, ys, zs, indexing='ij')
     pts = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1).astype(np.float64)
@@ -195,17 +211,24 @@ def visualize_zero_isosurface(
 
     spacing = (xs[1] - xs[0], ys[1] - ys[0], zs[1] - zs[0])
     level = 0.0
-    verts, faces, normals_mc, values = measure.marching_cubes(sdf_grid, level=level, spacing=spacing)
-    verts_world = verts + np.array(bmin, dtype=np.float64)[None, :]
-    if faces.shape[0] > max_tris:
-        step = int(math.ceil(faces.shape[0] / max_tris))
-        faces = faces[::step, :]
-
-    poly3d = verts_world[faces]
-    coll = Poly3DCollection(poly3d, linewidths=0.1, alpha=alpha)
-    if face_rgb is not None:
-        coll.set_facecolor(face_rgb)
-    ax.add_collection3d(coll)
+    vmin = float(np.min(sdf_grid)); vmax = float(np.max(sdf_grid))
+    if vmin <= level <= vmax:
+        verts, faces, normals_mc, values = measure.marching_cubes(sdf_grid, level=level, spacing=spacing)
+        verts_world = verts + np.array(bmin, dtype=np.float64)[None, :]
+        if faces.shape[0] > max_tris:
+            step = int(math.ceil(faces.shape[0] / max_tris))
+            faces = faces[::step, :]
+        poly3d = verts_world[faces]
+        coll = Poly3DCollection(poly3d, linewidths=0.1, alpha=alpha)
+        if face_rgb is not None:
+            coll.set_facecolor(face_rgb)
+        ax.add_collection3d(coll)
+    else:
+        msg = f"Zero level 0 not in SDF range [{vmin:.3g}, {vmax:.3g}]"
+        try:
+            ax.text2D(0.02, 0.02, msg, transform=ax.transAxes)
+        except Exception:
+            pass
 
     ax.set_xlim([bmin[0], bmax[0]])
     ax.set_ylim([bmin[1], bmax[1]])

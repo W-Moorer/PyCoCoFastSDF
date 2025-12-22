@@ -31,9 +31,9 @@ except Exception as e:
 
 # ==================== 参数定义 ====================
 # 在这里修改参数，无需通过命令行输入
-SDF_NPY_PATH = "./traditional_outputs/gear_sdf.npy"  # SDF 体素文件路径
-META_JSON_PATH = "./traditional_outputs/gear_meta.json"  # 元数据文件路径
-OBJ_PATH = "./obj_library/gear.obj"  # OBJ 网格文件路径
+SDF_NPY_PATH = "./traditional_outputs/RecurdynSlaveGearTri_sdf.npy"  # SDF 体素文件路径
+META_JSON_PATH = "./traditional_outputs/RecurdynSlaveGearTri_meta.json"  # 元数据文件路径
+OBJ_PATH = "./obj_library/RecurdynSlaveGearTri.obj"  # OBJ 网格文件路径
 CLIM = None  # 色标范围，例如 (0, 5) 或 None 表示自动
 PCTL = 95.0  # HDp 的分位数（默认 95）
 SCREENSHOT_PATH = None  # 截图保存路径，例如 "hd.png" 或 None

@@ -31,7 +31,7 @@ def pick_backend() -> str:
 # 获取当前脚本所在目录的父目录（项目根目录）
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(script_dir)
-obj_path = os.path.join(project_root, "obj_library", "sphere.obj")
+obj_path = os.path.join(project_root, "obj_library", "RecurdynSlaveGearTri.obj")
 
 # 从obj文件路径中提取文件名（不含扩展名）作为输出前缀
 obj_filename = os.path.splitext(os.path.basename(obj_path))[0]
@@ -49,7 +49,7 @@ try:
         V, F,
         padding=0.1,
         voxel_size=None,          # 留空则按 target_resolution / max_resolution 推断体素步长
-        target_resolution=256,    # 建议 128/256/512；或置 None 用 max_resolution
+        target_resolution=512,    # 建议 128/256/512；或置 None 用 max_resolution
         max_resolution=512,
         show_progress=True,
         workers=(-1 if backend != "torch3d_fwn" else 1),  # GPU 距离不吃 CPU 线程；CPU 路径开满线程
@@ -63,7 +63,7 @@ except Exception as e:
             V, F,
             padding=0.1,
             voxel_size=None,
-            target_resolution=256,
+            target_resolution=512,
             max_resolution=512,
             show_progress=True,
             workers=-1,

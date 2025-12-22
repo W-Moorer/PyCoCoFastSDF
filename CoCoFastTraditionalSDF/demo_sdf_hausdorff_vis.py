@@ -37,7 +37,7 @@ OBJ_PATH = "./obj_library/RecurdynSlaveGearTri.obj"  # OBJ 网格文件路径
 CLIM = None  # 色标范围，例如 (0, 5) 或 None 表示自动
 PCTL = 95.0  # HDp 的分位数（默认 95）
 SCREENSHOT_PATH = None  # 截图保存路径，例如 "hd.png" 或 None
-
+VTK_OUTPUT_PATH = "./outputs/haussdorff_error/gear_tradition_sdf.vtp"  # VTK文件输出路径，用于ParaView查看
 
 # =================================================
 
@@ -86,6 +86,17 @@ def load_obj_surface(obj_path: str) -> pv.PolyData:
     m = m.triangulate()
     return m
 
+def save_vtk_polydata(mesh: pv.PolyData, output_path: str):
+    """保存PyVista PolyData为VTK XML PolyData (.vtp)文件，可用于ParaView查看。"""
+    # 确保输出目录存在
+    import os
+    output_dir = os.path.dirname(output_path)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+    
+    # 保存为VTK XML PolyData格式
+    mesh.save(output_path, binary=True)  # 使用二进制格式，文件更小，加载更快
+    print(f"VTK文件已保存到: {output_path}")
 
 # -------------------- 距离计算 --------------------
 
@@ -246,7 +257,9 @@ def main():
     print("\n【距离计算】")
     print("  正在计算 OBJ → Iso 距离...")
     d_obj_to_iso = distances_A_to_B_surface(obj, iso)
-
+    # 将距离数据添加到OBJ网格中，以便保存到VTK文件
+    obj["d_to_iso"] = d_obj_to_iso
+    
     # 5) 统计单向距离指标
     print("\n【统计指标】")
     metrics = summarize_unidirectional_distance(d_obj_to_iso, pctl=PCTL)
@@ -271,6 +284,9 @@ def main():
 
     plot_interactive(iso, obj, d_obj_to_iso,
                      metrics, clim=CLIM, screenshot=SCREENSHOT_PATH)
+    # 保存结果为VTK文件，用于ParaView查看
+    print("\n【保存VTK文件】")
+    save_vtk_polydata(obj, VTK_OUTPUT_PATH)
 
     print("\n程序执行完成！")
 

@@ -12,9 +12,9 @@ import numpy as np
 from gradient_sdf import GradientSDF, taylor_query_batch_dense
 
 # ===================== 配置区 =====================
-OBJ_PATH = "../obj_library/gear.obj"
-OUT_DENSE_PREFIX = "../gradient_outputs/gear"
-OUT_NPZ = "../gradient_outputs/gear_sparse.npz"
+OBJ_PATH = "./obj_library/RecurdynSlaveGearTri.obj"
+OUT_DENSE_PREFIX = "./outputs/RecurdynSlaveGearTri"
+OUT_NPZ = "./outputs/RecurdynSlaveGearTri_sparse.npz"
 
 TAU_VOXELS = 6.0
 BLOCK_SIZE = 8

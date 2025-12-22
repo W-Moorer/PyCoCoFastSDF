@@ -564,24 +564,31 @@ def _compute_bounds(V: np.ndarray, padding: float) -> Tuple[np.ndarray, np.ndarr
     return (vmin - pad).astype(np.float64), (vmax + pad).astype(np.float64)
 
 
-def _voxel_axes(bmin: np.ndarray, bmax: np.ndarray,
-                voxel_size: Optional[float],
-                target_resolution: Optional[int],
-                max_resolution: int):
-    size = (bmax - bmin).astype(np.float64)
-    if voxel_size is None:
-        if target_resolution is None:
-            target_resolution = min(192, max_resolution)
-        longest = float(size.max())
-        voxel = longest / float(target_resolution)
-    else:
-        voxel = float(voxel_size)
+def _voxel_grid_axes(bmin: np.ndarray, bmax: np.ndarray, voxel_size: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    # 修正 1: 使用 Cell-Centered 逻辑，起点偏移半个 voxel_size
+    # 修正 2: 使用 np.arange 保证步长严格一致，避免 linspace 的拉伸误差
+    
+    # 重新计算基于步长的终点，确保覆盖原始 bmax
+    # 这里我们生成从 bmin + half_step 开始的序列
+    half_step = voxel_size * 0.5
+    
+    # X 轴
+    xs = np.arange(bmin[0] + half_step, bmax[0], voxel_size, dtype=np.float64)
+    # 确保最后一个点如果不小心超出了 bmax (由于浮点误差) 或没覆盖到，进行微调
+    if xs[-1] + half_step < bmax[0]:
+        xs = np.append(xs, xs[-1] + voxel_size)
 
-    nx, ny, nz = np.maximum(1, np.ceil(size / voxel).astype(int))
-    xs = np.linspace(bmin[0] + 0.5*voxel, bmin[0] + (nx-0.5)*voxel, nx, dtype=np.float64)
-    ys = np.linspace(bmin[1] + 0.5*voxel, bmin[1] + (ny-0.5)*voxel, ny, dtype=np.float64)
-    zs = np.linspace(bmin[2] + 0.5*voxel, bmin[2] + (nz-0.5)*voxel, nz, dtype=np.float64)
-    return xs, ys, zs, np.array([voxel, voxel, voxel], dtype=np.float64)
+    # Y 轴
+    ys = np.arange(bmin[1] + half_step, bmax[1], voxel_size, dtype=np.float64)
+    if ys[-1] + half_step < bmax[1]:
+        ys = np.append(ys, ys[-1] + voxel_size)
+
+    # Z 轴
+    zs = np.arange(bmin[2] + half_step, bmax[2], voxel_size, dtype=np.float64)
+    if zs[-1] + half_step < bmax[2]:
+        zs = np.append(zs, zs[-1] + voxel_size)
+        
+    return xs, ys, zs
 
 
 def _grid_points(xs: np.ndarray, ys: np.ndarray, zs: np.ndarray) -> np.ndarray:
@@ -651,7 +658,19 @@ def compute_sdf_grid(vertices: np.ndarray,
 
     t0 = time.time()
     bmin, bmax = _compute_bounds(vertices, padding)
-    xs, ys, zs, vstep = _voxel_axes(bmin, bmax, voxel_size, target_resolution, max_resolution)
+    
+    # 计算体素大小，与传统SDF保持一致
+    if voxel_size is None:
+        size = bmax - bmin
+        if target_resolution is None:
+            target_resolution = max_resolution
+        longest = float(np.max(size))
+        voxel_size = longest / float(target_resolution)
+    
+    # 使用新的体素网格轴生成逻辑
+    xs, ys, zs = _voxel_grid_axes(bmin, bmax, voxel_size)
+    vstep = np.array([xs[1]-xs[0], ys[1]-ys[0], zs[1]-zs[0]], dtype=np.float64)
+    
     pts = _grid_points(xs, ys, zs)
     centers = vertices[faces].mean(axis=1).astype(np.float64)
     fN = _face_normals(vertices, faces)
@@ -749,24 +768,73 @@ def _marching_cubes_world(sdf_grid: np.ndarray, bounds: Tuple[np.ndarray, np.nda
     return verts_world, faces
 
 
-def visualize_zero_isosurface(sdf_grid: np.ndarray,
-                              bounds: Tuple[np.ndarray, np.ndarray],
-                              out_path: str):
-    if not (_HAS_MPL and _HAS_SKIMAGE):
-        return
-    res = _marching_cubes_world(sdf_grid, bounds)
-    if res is None:
-        return
-    verts_world, faces = res
-    fig = plt.figure(figsize=(6, 6))
+def visualize_zero_isosurface(
+    sdf_grid: np.ndarray,
+    bounds: Tuple[np.ndarray, np.ndarray],
+    out_path: Optional[str] = None,
+    max_tris: int = 500_000,
+    alpha: float = 0.6,
+    face_rgb: Optional[Tuple[float, float, float]] = (0.3, 0.5, 0.8),
+    transparent_bg: bool = False
+):
+    if not _HAS_MPL:
+        raise RuntimeError("matplotlib 不可用")
+    if not _HAS_SKIMAGE:
+        raise RuntimeError("需要 scikit-image：pip install scikit-image")
+
+    try:
+        import matplotlib
+        matplotlib.rcParams['font.family'] = 'Times New Roman'
+    except Exception:
+        pass
+
+    bmin, bmax = bounds
+    nx, ny, nz = sdf_grid.shape
+    xs = np.linspace(bmin[0], bmax[0], int(nx), dtype=np.float64)
+    ys = np.linspace(bmin[1], bmax[1], int(ny), dtype=np.float64)
+    zs = np.linspace(bmin[2], bmax[2], int(nz), dtype=np.float64)
+
+    fig = plt.figure(figsize=(8, 6))
     ax = fig.add_subplot(111, projection='3d')
-    ax.plot_trisurf(verts_world[:, 0], verts_world[:, 1], Z=verts_world[:, 2],
-                    triangles=faces, linewidth=0.0, antialiased=True, alpha=0.85)
-    ax.set_box_aspect([1, 1, 1])
-    ax.set_title("Zero Isosurface")
-    _ensure_dir_for(out_path)
-    fig.savefig(out_path, dpi=180, bbox_inches='tight')
-    plt.close(fig)
+    ax.set_axis_off()
+
+    spacing = (xs[1] - xs[0], ys[1] - ys[0], zs[1] - zs[0])
+    level = 0.0
+    vmin = float(np.min(sdf_grid)); vmax = float(np.max(sdf_grid))
+    if vmin <= level <= vmax:
+        verts, faces, normals_mc, values = _measure.marching_cubes(sdf_grid, level=level, spacing=spacing)
+        verts_world = verts + np.array(bmin, dtype=np.float64)[None, :]
+        if faces.shape[0] > max_tris:
+            import math
+            step = int(math.ceil(faces.shape[0] / max_tris))
+            faces = faces[::step, :]
+        poly3d = verts_world[faces]
+        coll = plt.Poly3DCollection(poly3d, linewidths=0.1, alpha=alpha)
+        if face_rgb is not None:
+            coll.set_facecolor(face_rgb)
+        ax.add_collection3d(coll)
+    else:
+        msg = f"Zero level 0 not in SDF range [{vmin:.3g}, {vmax:.3g}]"
+        try:
+            ax.text2D(0.02, 0.02, msg, transform=ax.transAxes)
+        except Exception:
+            pass
+
+    ax.set_xlim([bmin[0], bmax[0]])
+    ax.set_ylim([bmin[1], bmax[1]])
+    ax.set_zlim([bmin[2], bmax[2]])
+
+    if out_path:
+        _ensure_dir_for(out_path)
+        if transparent_bg:
+            fig.savefig(out_path, dpi=200, bbox_inches='tight', pad_inches=0.05, transparent=True)
+        else:
+            fig.savefig(out_path, dpi=200, bbox_inches='tight', pad_inches=0.05)
+        plt.close(fig)
+    else:
+        plt.show()
+
+    return out_path
 
 
 def save_timings_pie(timings: Dict[str, float], out_path: str):

@@ -14,8 +14,8 @@ from gradient_sdf import GradientSDF, DenseGradientSDF, HashedGradientSDF, GridS
 
 # ===================== 配置区 =====================
 OBJ_PATH = None   # 若提供 DENSE_PREFIX，可更快
-DENSE_PREFIX = "../gradient_outputs/gear"
-NPZ_PATH = "../gradient_outputs/gear.npz"                       # 仅 .npz 不足以完成全部对比，此处会改为从 OBJ 构建
+DENSE_PREFIX = "./outputs/RecurdynSlaveGearTri"
+NPZ_PATH = "./outputs/RecurdynSlaveGearTri.npz"                       # 仅 .npz 不足以完成全部对比，此处会改为从 OBJ 构建
 
 TAU_VOXELS = 6.0
 BLOCK_SIZE = 8
